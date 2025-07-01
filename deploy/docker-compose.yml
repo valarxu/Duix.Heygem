@@ -94,6 +94,7 @@ services:
     restart: always
     volumes:
       - ./queue-service:/app
+      - d:/heygem_data:/data/heygem_data
       - /app/node_modules  # 匿名卷，避免本地node_modules覆盖
     working_dir: /app
     command: sh -c "npm install --production && npm start"

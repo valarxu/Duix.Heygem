@@ -1,6 +1,7 @@
 const express = require('express');
 const Redis = require('ioredis');
 const axios = require('axios');
+const fs = require('fs');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -45,7 +46,11 @@ app.get('/health', async (req, res) => {
       status: 'ok', 
       timestamp: new Date().toISOString(),
       redis: 'connected',
-      processing: processor.processing
+      processors: {
+        video: processor.processing,
+        tts: ttsProcessor.processing,
+        ttsToVideo: ttsToVideoProcessor.processing
+      }
     });
   } catch (error) {
     res.status(503).json({ 
@@ -127,10 +132,10 @@ app.get('/api/video/status/:taskId', async (req, res) => {
     }
     
     const task = JSON.parse(taskData);
-    
-    // 如果任务还在队列中，计算当前位置
-    if (task.status === 'queued') {
-      const queueItems = await redis.lrange('video_queue', 0, -1);
+     
+     // 如果任务还在队列中，计算当前位置
+     if (task.status === 'queued') {
+       const queueItems = await redis.lrange('video_queue', 0, -1);
       const position = queueItems.findIndex(item => {
         const queueTask = JSON.parse(item);
         return queueTask.id === taskId;
@@ -278,10 +283,10 @@ app.get('/api/tts/status/:taskId', async (req, res) => {
     }
     
     const task = JSON.parse(taskData);
-    
-    // 如果任务还在队列中，计算当前位置
-    if (task.status === 'queued') {
-      const queueName = task.type === 'preprocess' ? 'tts_preprocess_queue' : 'tts_invoke_queue';
+     
+     // 如果任务还在队列中，计算当前位置
+     if (task.status === 'queued') {
+       const queueName = task.type === 'preprocess' ? 'tts_preprocess_queue' : 'tts_invoke_queue';
       const queueItems = await redis.lrange(queueName, 0, -1);
       const position = queueItems.findIndex(item => {
         const queueTask = JSON.parse(item);
@@ -383,12 +388,15 @@ app.get('/api/queue/stats', async (req, res) => {
     const videoQueueLength = await redis.llen('video_queue');
     const ttsPreprocessQueueLength = await redis.llen('tts_preprocess_queue');
     const ttsInvokeQueueLength = await redis.llen('tts_invoke_queue');
+    const ttsToVideoQueueLength = await redis.llen('tts_to_video_queue');
     const totalVideoTasks = await redis.hlen('tasks');
     const totalTtsTasks = await redis.hlen('tts_tasks');
+    const totalTtsToVideoTasks = await redis.hlen('tts_to_video_tasks');
     
     // 获取各状态任务数量
     const allVideoTasks = await redis.hgetall('tasks');
     const allTtsTasks = await redis.hgetall('tts_tasks');
+    const allTtsToVideoTasks = await redis.hgetall('tts_to_video_tasks');
     const videoStatusCounts = {
       queued: 0,
       processing: 0,
@@ -397,6 +405,13 @@ app.get('/api/queue/stats', async (req, res) => {
       timeout: 0
     };
     const ttsStatusCounts = {
+      queued: 0,
+      processing: 0,
+      completed: 0,
+      failed: 0,
+      timeout: 0
+    };
+    const ttsToVideoStatusCounts = {
       queued: 0,
       processing: 0,
       completed: 0,
@@ -426,6 +441,17 @@ app.get('/api/queue/stats', async (req, res) => {
       }
     });
     
+    Object.values(allTtsToVideoTasks).forEach(taskJson => {
+      try {
+        const task = JSON.parse(taskJson);
+        if (ttsToVideoStatusCounts.hasOwnProperty(task.status)) {
+          ttsToVideoStatusCounts[task.status]++;
+        }
+      } catch (e) {
+        // 忽略解析错误的任务
+      }
+    });
+    
     res.json({
       success: true,
       video: {
@@ -443,6 +469,13 @@ app.get('/api/queue/stats', async (req, res) => {
         processing: ttsProcessor.processing,
         currentTask: ttsProcessor.currentTask ? ttsProcessor.currentTask.id : null
       },
+      ttsToVideo: {
+        queueLength: ttsToVideoQueueLength,
+        totalTasks: totalTtsToVideoTasks,
+        statusCounts: ttsToVideoStatusCounts,
+        processing: ttsToVideoProcessor.processing,
+        currentTask: ttsToVideoProcessor.currentTask ? ttsToVideoProcessor.currentTask.id : null
+      },
       uptime: process.uptime()
     });
   } catch (error) {
@@ -454,7 +487,177 @@ app.get('/api/queue/stats', async (req, res) => {
   }
 });
 
-// 7. 取消任务（可选功能）
+// 7. TTS转视频组合任务提交
+app.post('/api/tts-to-video/submit', async (req, res) => {
+  try {
+    // 验证请求参数
+    if (!req.body || Object.keys(req.body).length === 0) {
+      return res.status(400).json({ error: 'Request body is required' });
+    }
+
+    // 验证必需的参数
+    if (!req.body.ttsParams || !req.body.videoParams) {
+      return res.status(400).json({ 
+        error: 'Both ttsParams and videoParams are required',
+        message: '需要同时提供TTS参数和视频生成参数'
+      });
+    }
+
+    const taskId = `tts_to_video_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const currentQueueLength = await redis.llen('tts_to_video_queue');
+    
+    const taskData = {
+      id: taskId,
+      type: 'tts_to_video',
+      ttsParams: req.body.ttsParams,
+      videoParams: req.body.videoParams,
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+      queuePosition: currentQueueLength + 1,
+      clientIP: req.ip || req.connection.remoteAddress,
+      phase: 'pending' // pending, tts, video, completed
+    };
+    
+    // 添加到TTS转视频队列
+    await redis.lpush('tts_to_video_queue', JSON.stringify(taskData));
+    
+    // 保存任务状态
+    await redis.hset('tts_to_video_tasks', taskId, JSON.stringify(taskData));
+    
+    // 设置任务过期时间（24小时）
+    await redis.expire(`tts_to_video_tasks:${taskId}`, 86400);
+    
+    console.log(`TTS-to-Video task ${taskId} added to queue, position: ${taskData.queuePosition}`);
+    
+    res.json({ 
+      success: true,
+      taskId, 
+      status: 'queued',
+      phase: 'pending',
+      queuePosition: taskData.queuePosition,
+      estimatedWaitTime: taskData.queuePosition * 90, // 假设每个任务90秒（TTS+视频）
+      message: 'TTS转视频任务已加入队列，请使用taskId查询进度'
+    });
+  } catch (error) {
+    console.error('TTS-to-Video submit error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      message: '提交TTS转视频任务失败，请稍后重试'
+    });
+  }
+});
+
+// 8. 查询TTS转视频任务状态
+app.get('/api/tts-to-video/status/:taskId', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    if (!taskId) {
+      return res.status(400).json({ error: 'TaskId is required' });
+    }
+
+    const taskData = await redis.hget('tts_to_video_tasks', taskId);
+    if (!taskData) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Task not found',
+        message: 'TTS转视频任务不存在或已过期'
+      });
+    }
+    
+    const task = JSON.parse(taskData);
+    
+
+    
+    // 如果任务还在队列中，计算当前位置
+    if (task.status === 'queued') {
+      const queueItems = await redis.lrange('tts_to_video_queue', 0, -1);
+      const position = queueItems.findIndex(item => {
+        const queueTask = JSON.parse(item);
+        return queueTask.id === taskId;
+      });
+      task.queuePosition = position >= 0 ? position + 1 : 0;
+      task.estimatedWaitTime = task.queuePosition * 90;
+    }
+    
+    // 如果任务完成，生成视频URL
+    if (task.status === 'completed' && task.videoPath) {
+      const fileName = task.videoPath.split('/').pop();
+      task.videoUrl = `http://${req.get('host')}/videos/${fileName}`;
+    }
+    
+    // 如果TTS阶段完成，提供音频下载链接
+    if (task.ttsResult && task.ttsResult.audioData) {
+      task.audioUrl = `/api/tts-to-video/audio/${taskId}`;
+    }
+    
+    res.json({
+      success: true,
+      ...task
+    });
+  } catch (error) {
+    console.error('TTS-to-Video status query error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      message: '查询TTS转视频任务状态失败'
+    });
+  }
+});
+
+// 9. 获取TTS转视频任务的音频文件
+app.get('/api/tts-to-video/audio/:taskId', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    if (!taskId) {
+      return res.status(400).json({ error: 'TaskId is required' });
+    }
+
+    const taskData = await redis.hget('tts_to_video_tasks', taskId);
+    if (!taskData) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Task not found',
+        message: 'TTS转视频任务不存在或已过期'
+      });
+    }
+    
+    const task = JSON.parse(taskData);
+    
+    if (!task.ttsResult || !task.ttsResult.audioData) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Audio data not found',
+        message: 'TTS音频数据不存在或尚未生成'
+      });
+    }
+    
+    // 将base64音频数据转换为Buffer
+    const audioBuffer = Buffer.from(task.ttsResult.audioData, 'base64');
+    
+    // 设置响应头
+    res.set({
+      'Content-Type': task.ttsResult.contentType || 'audio/wav',
+      'Content-Length': audioBuffer.length,
+      'Content-Disposition': `attachment; filename="audio_${taskId}.wav"`
+    });
+    
+    // 返回音频数据
+    res.send(audioBuffer);
+    
+  } catch (error) {
+    console.error('TTS-to-Video audio download error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      message: '下载音频文件失败'
+    });
+  }
+});
+
+// 10. 取消任务（可选功能）
 app.delete('/api/video/cancel/:taskId', async (req, res) => {
   try {
     const { taskId } = req.params;
@@ -512,6 +715,258 @@ app.delete('/api/video/cancel/:taskId', async (req, res) => {
     });
   }
 });
+
+// TTS转视频队列处理器
+class TtsToVideoQueueProcessor {
+  constructor() {
+    this.processing = false;
+    this.currentTask = null;
+    this.processedCount = 0;
+    this.startTime = new Date();
+    this.startProcessing();
+  }
+  
+  async startProcessing() {
+    console.log('TTS-to-Video Queue processor started at', new Date().toISOString());
+    
+    while (true) {
+      try {
+        if (!this.processing) {
+          await this.processNext();
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (error) {
+        console.error('TTS-to-Video Queue processing error:', error);
+        await new Promise(resolve => setTimeout(resolve, 10000)); // 错误后等待10秒
+      }
+    }
+  }
+  
+  async processNext() {
+    try {
+      // 阻塞式获取队列任务，超时1秒
+      const result = await redis.brpop('tts_to_video_queue', 1);
+      if (!result) return;
+      
+      const task = JSON.parse(result[1]);
+      this.processing = true;
+      this.currentTask = task;
+      
+      console.log(`[${new Date().toISOString()}] Processing TTS-to-Video task ${task.id}`);
+      
+      await this.processTask(task);
+      
+    } catch (error) {
+      console.error('TTS-to-Video Process next error:', error);
+    } finally {
+      this.processing = false;
+      this.currentTask = null;
+    }
+  }
+  
+  async processTask(task) {
+    try {
+      // 更新状态为处理中
+      task.status = 'processing';
+      task.startedAt = new Date().toISOString();
+      task.phase = 'tts';
+      await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+      
+      console.log(`Starting TTS phase for task ${task.id}`);
+      
+      // 第一阶段：调用TTS invoke接口
+      const ttsResponse = await axios.post(
+        'http://heygem-tts:8080/v1/invoke', 
+        task.ttsParams,
+        { 
+          timeout: 120000,
+          responseType: 'arraybuffer',
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      if (!ttsResponse || !ttsResponse.data) {
+        throw new Error('Invalid response from TTS service');
+      }
+      
+      // 保存TTS音频文件到本地
+      const audioBuffer = Buffer.from(ttsResponse.data);
+      const audioFileName = `tts_audio_${task.id}_${Date.now()}.wav`;
+      const audioFilePath = `/data/heygem_data/face2face/temp/${audioFileName}`;
+      
+      // 确保目录存在
+      const audioDir = '/data/heygem_data/face2face/temp';
+      if (!fs.existsSync(audioDir)) {
+        fs.mkdirSync(audioDir, { recursive: true });
+      }
+      
+      // 写入音频文件
+      fs.writeFileSync(audioFilePath, audioBuffer);
+      
+      // 保存TTS结果
+      task.ttsResult = {
+        audioData: Buffer.from(ttsResponse.data).toString('base64'),
+        contentType: 'audio/wav',
+        audioFilePath: audioFilePath,
+        audioFileName: audioFileName
+      };
+      task.ttsCompletedAt = new Date().toISOString();
+      task.phase = 'video';
+      await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+      
+      console.log(`TTS phase completed for task ${task.id}, audio saved to ${audioFilePath}`);
+      
+      // 第二阶段：调用视频生成接口
+      // 确保参数中包含code字段
+      if (!task.videoParams.code) {
+        task.videoParams.code = `code_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      }
+      
+      // 将音频文件路径转换为HTTP URL
+      // 从 /data/heygem_data/face2face/temp/filename.wav 转换为 http://nginx-proxy/audios/filename.wav
+      const audioHttpUrl = `http://nginx-proxy/audios/${audioFileName}`;
+      task.videoParams.audio_url = audioHttpUrl;
+      
+      console.log(`Starting video generation for task ${task.id} with audio: ${audioHttpUrl}`);
+      
+      // 调用Heygem服务提交任务
+      const submitResponse = await axios.post(
+        'http://heygem-gen-video:8383/easy/submit', 
+        task.videoParams,
+        { 
+          timeout: 30000,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      // 检查Heygem服务响应格式
+      if (!submitResponse.data || !submitResponse.data.success) {
+        throw new Error('Invalid response from Heygem service');
+      }
+      
+      // 使用提交时的code作为任务标识
+      const heygem_code = task.videoParams.code;
+      task.heygem_code = heygem_code;
+      task.phase = 'video';
+      await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+      
+      console.log(`Heygem task code: ${heygem_code} for task ${task.id}`);
+      
+      // 轮询视频生成状态
+      let completed = false;
+      let pollCount = 0;
+      const maxPolls = 180; // 最多轮询6分钟（每2秒一次）
+      
+      while (!completed && pollCount < maxPolls) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        pollCount++;
+        
+        try {
+          const statusResponse = await axios.get(
+            `http://heygem-gen-video:8383/easy/query?code=${heygem_code}`,
+            { timeout: 10000 }
+          );
+          
+          console.log(`Poll ${pollCount}: Task ${task.id} Heygem response:`, JSON.stringify(statusResponse.data));
+          
+          // 处理Heygem服务的实际响应格式
+          if (statusResponse.data.code === 10004) {
+            // 任务不存在，可能是code参数问题
+            console.error(`Task ${task.id}: Heygem task not found with code ${heygem_code}`);
+            task.status = 'failed';
+            task.error = 'Heygem task not found - code mismatch';
+            task.completedAt = new Date().toISOString();
+            completed = true;
+          } else if (statusResponse.data.code === 10000) {
+            // 成功响应，检查任务状态
+            const heygem_data = statusResponse.data.data || {};
+            const { status, video_path, error } = heygem_data;
+            
+            console.log(`Poll ${pollCount}: Task ${task.id} Heygem status: ${status}`);
+            
+            if (status === 2 && video_path) {
+              task.status = 'completed';
+              task.phase = 'completed';
+              task.videoPath = video_path;
+              task.completedAt = new Date().toISOString();
+              task.processingTime = new Date() - new Date(task.startedAt);
+              completed = true;
+              this.processedCount++;
+              console.log(`TTS-to-Video task ${task.id} completed successfully in ${task.processingTime}ms`);
+            } else if (status == 0) {
+              task.status = 'failed';
+              task.error = error || 'Video generation failed';
+              task.completedAt = new Date().toISOString();
+              completed = true;
+              console.log(`TTS-to-Video task ${task.id} failed: ${task.error}`);
+            } else if (status == 1) {
+              // 继续轮询
+              task.lastPollAt = new Date().toISOString();
+              await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+            } else {
+              // 检查是否有生成的视频文件（基于文件系统）
+              const videoFileName = `${heygem_code}-r.mp4`;
+              console.log(`Checking for video file: ${videoFileName}`);
+              
+              // 如果状态未知但可能已完成，标记为完成
+              if (pollCount > 30) { // 轮询超过1分钟后检查文件
+                task.status = 'completed';
+                task.phase = 'completed';
+                task.videoPath = `/data/heygem_data/face2face/temp/${videoFileName}`;
+                task.completedAt = new Date().toISOString();
+                task.processingTime = new Date() - new Date(task.startedAt);
+                completed = true;
+                this.processedCount++;
+                console.log(`TTS-to-Video task ${task.id} marked as completed based on file existence`);
+              } else {
+                console.warn(`Unknown status ${status} for task ${task.id}, continuing to poll`);
+                task.lastPollAt = new Date().toISOString();
+                await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+              }
+            }
+          } else {
+            console.warn(`Unexpected Heygem response code ${statusResponse.data.code} for task ${task.id}`);
+            task.lastPollAt = new Date().toISOString();
+            await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+          }
+          
+        } catch (pollError) {
+          console.error(`Poll error for task ${task.id} (attempt ${pollCount}):`, pollError.message);
+          
+          // 如果是网络错误，继续重试
+          if (pollError.code === 'ECONNREFUSED' || pollError.code === 'ETIMEDOUT') {
+            continue;
+          }
+          
+          // 其他错误，减少重试次数
+          if (pollCount > 5) {
+            throw pollError;
+          }
+        }
+      }
+      
+      if (!completed) {
+        task.status = 'timeout';
+        task.error = `Video generation timeout after ${maxPolls * 2} seconds`;
+        task.completedAt = new Date().toISOString();
+        console.log(`TTS-to-Video task ${task.id} timed out after ${maxPolls} polls`);
+      }
+      
+      await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+      
+    } catch (error) {
+      console.error(`TTS-to-Video task ${task.id} processing error:`, error.message);
+      task.status = 'failed';
+      task.error = error.message;
+      task.completedAt = new Date().toISOString();
+      await redis.hset('tts_to_video_tasks', task.id, JSON.stringify(task));
+    }
+  }
+}
 
 // TTS队列处理器
 class TtsQueueProcessor {
@@ -828,6 +1283,7 @@ class QueueProcessor {
 // 启动队列处理器
 const processor = new QueueProcessor();
 const ttsProcessor = new TtsQueueProcessor();
+const ttsToVideoProcessor = new TtsToVideoQueueProcessor();
 
 // 优雅关闭处理
 const gracefulShutdown = async (signal) => {
@@ -839,9 +1295,9 @@ const gracefulShutdown = async (signal) => {
   });
   
   // 等待当前任务完成
-  if (processor.processing) {
-    console.log('Waiting for current task to complete...');
-    while (processor.processing) {
+  if (processor.processing || ttsProcessor.processing || ttsToVideoProcessor.processing) {
+    console.log('Waiting for current tasks to complete...');
+    while (processor.processing || ttsProcessor.processing || ttsToVideoProcessor.processing) {
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }

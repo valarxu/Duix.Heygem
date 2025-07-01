@@ -2,6 +2,10 @@ networks:
   ai_network:
     driver: bridge
 
+volumes:
+  redis_data:
+    driver: local
+
 services:
   heygem-tts:
     image: guiji2025/fish-speech-ziming
@@ -58,3 +62,87 @@ services:
     command: python /code/app_local.py
     networks:
       - ai_network
+    
+  # 添加Redis服务
+  redis:
+    image: redis:7-alpine
+    container_name: heygem-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ai_network
+    command: >
+      redis-server 
+      --appendonly yes 
+      --appendfsync everysec 
+      --maxmemory 512mb 
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # 添加队列管理服务
+  queue-manager:
+    image: node:18-alpine
+    container_name: heygem-queue
+    restart: always
+    volumes:
+      - ./queue-service:/app
+      - /app/node_modules  # 匿名卷，避免本地node_modules覆盖
+    working_dir: /app
+    command: sh -c "npm install --production && npm start"
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ALLOWED_ORIGINS=*
+    depends_on:
+      redis:
+        condition: service_healthy
+      heygem-gen-video:
+        condition: service_started
+    networks:
+      - ai_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # 添加Nginx代理服务
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: heygem-nginx
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      - d:/heygem_data:/data/heygem_data:ro
+    depends_on:
+      queue-manager:
+        condition: service_healthy
+      heygem-gen-video:
+        condition: service_started
+    networks:
+      - ai_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

@@ -884,14 +884,14 @@ class TtsToVideoQueueProcessor {
           } else if (statusResponse.data.code === 10000) {
             // 成功响应，检查任务状态
             const heygem_data = statusResponse.data.data || {};
-            const { status, video_path, error } = heygem_data;
+            const { status, result, error } = heygem_data;
             
             console.log(`Poll ${pollCount}: Task ${task.id} Heygem status: ${status}`);
             
-            if (status === 2 && video_path) {
+            if (status === 2 && result) {
               task.status = 'completed';
               task.phase = 'completed';
-              task.videoPath = video_path;
+              task.videoPath = result;
               task.completedAt = new Date().toISOString();
               task.processingTime = new Date() - new Date(task.startedAt);
               completed = true;

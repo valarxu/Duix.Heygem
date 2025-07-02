@@ -144,10 +144,9 @@ app.get('/api/video/status/:taskId', async (req, res) => {
       task.estimatedWaitTime = task.queuePosition * 60;
     }
     
-    // 如果任务完成，生成视频URL
+    // 如果任务完成，提供视频下载链接
     if (task.status === 'completed' && task.videoPath) {
-      const fileName = task.videoPath.split('/').pop();
-      task.videoUrl = `http://${req.get('host')}/videos/${fileName}`;
+      task.videoUrl = `/api/video/download/${taskId}`;
     }
     
     res.json({
@@ -581,15 +580,18 @@ app.get('/api/tts-to-video/status/:taskId', async (req, res) => {
       task.estimatedWaitTime = task.queuePosition * 90;
     }
     
-    // 如果任务完成，生成视频URL
+    // 如果任务完成，提供视频下载链接
     if (task.status === 'completed' && task.videoPath) {
-      const fileName = task.videoPath.split('/').pop();
-      task.videoUrl = `http://${req.get('host')}/videos/${fileName}`;
+      task.videoDownloadUrl = `/api/tts-to-video/video/${taskId}`;
     }
     
     // 如果TTS阶段完成，提供音频下载链接
-    if (task.ttsResult && task.ttsResult.audioData) {
-      task.audioUrl = `/api/tts-to-video/audio/${taskId}`;
+    if (task.ttsResult && task.ttsResult.audioFilePath) {
+      task.audioDownloadUrl = `/api/tts-to-video/audio/${taskId}`;
+      // 移除audioData以减少响应大小
+      if (task.ttsResult.audioData) {
+        delete task.ttsResult.audioData;
+      }
     }
     
     res.json({
@@ -626,26 +628,49 @@ app.get('/api/tts-to-video/audio/:taskId', async (req, res) => {
     
     const task = JSON.parse(taskData);
     
-    if (!task.ttsResult || !task.ttsResult.audioData) {
+    if (!task.ttsResult || !task.ttsResult.audioFilePath) {
       return res.status(404).json({ 
         success: false,
-        error: 'Audio data not found',
-        message: 'TTS音频数据不存在或尚未生成'
+        error: 'Audio file not found',
+        message: 'TTS音频文件不存在或尚未生成'
       });
     }
     
-    // 将base64音频数据转换为Buffer
-    const audioBuffer = Buffer.from(task.ttsResult.audioData, 'base64');
+    // 检查音频文件是否存在
+    const fs = require('fs');
+    if (!fs.existsSync(task.ttsResult.audioFilePath)) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Audio file not found',
+        message: '音频文件不存在'
+      });
+    }
+    
+    // 获取文件信息
+    const fileName = task.ttsResult.audioFileName || `audio_${taskId}.wav`;
+    const fileStats = fs.statSync(task.ttsResult.audioFilePath);
     
     // 设置响应头
     res.set({
       'Content-Type': task.ttsResult.contentType || 'audio/wav',
-      'Content-Length': audioBuffer.length,
-      'Content-Disposition': `attachment; filename="audio_${taskId}.wav"`
+      'Content-Length': fileStats.size,
+      'Content-Disposition': `attachment; filename="${fileName}"`
     });
     
-    // 返回音频数据
-    res.send(audioBuffer);
+    // 创建文件流并返回音频数据
+    const fileStream = fs.createReadStream(task.ttsResult.audioFilePath);
+    fileStream.pipe(res);
+    
+    fileStream.on('error', (error) => {
+      console.error('Audio stream error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ 
+          success: false,
+          error: 'Failed to stream audio file',
+          message: '音频文件流传输失败'
+        });
+      }
+    });
     
   } catch (error) {
     console.error('TTS-to-Video audio download error:', error);
@@ -657,7 +682,143 @@ app.get('/api/tts-to-video/audio/:taskId', async (req, res) => {
   }
 });
 
-// 10. 取消任务（可选功能）
+// 10. 获取TTS转视频任务的视频文件
+app.get('/api/tts-to-video/video/:taskId', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    if (!taskId) {
+      return res.status(400).json({ error: 'TaskId is required' });
+    }
+
+    const taskData = await redis.hget('tts_to_video_tasks', taskId);
+    if (!taskData) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Task not found',
+        message: 'TTS转视频任务不存在或已过期'
+      });
+    }
+    
+    const task = JSON.parse(taskData);
+    
+    if (task.status !== 'completed' || !task.videoPath) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Video not found',
+        message: '视频文件不存在或尚未生成完成'
+      });
+    }
+    
+    // 检查视频文件是否存在
+    const fs = require('fs');
+    
+    if (!fs.existsSync(task.videoPath)) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Video file not found',
+        message: '视频文件在服务器上不存在'
+      });
+    }
+    
+    // 获取文件信息
+    const fileName = task.videoPath.split('/').pop();
+    const fileStats = fs.statSync(task.videoPath);
+    
+    // 设置响应头
+    res.set({
+      'Content-Type': 'video/mp4',
+      'Content-Length': fileStats.size,
+      'Content-Disposition': `attachment; filename="video_${taskId}.mp4"`,
+      'Accept-Ranges': 'bytes'
+    });
+    
+    // 创建文件流并返回视频数据
+    const fileStream = fs.createReadStream(task.videoPath);
+    fileStream.pipe(res);
+    
+  } catch (error) {
+    console.error('TTS-to-Video video download error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      message: '下载视频文件失败'
+    });
+  }
+});
+
+// 11. 获取普通视频任务的视频文件
+app.get('/api/video/download/:taskId', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    if (!taskId) {
+      return res.status(400).json({ error: 'TaskId is required' });
+    }
+
+    const taskData = await redis.hget('tasks', taskId);
+    if (!taskData) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Task not found',
+        message: '视频任务不存在或已过期'
+      });
+    }
+    
+    const task = JSON.parse(taskData);
+    
+    if (task.status !== 'completed' || !task.videoPath) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Video not found',
+        message: '视频文件不存在或尚未生成完成'
+      });
+    }
+    
+    // 检查视频文件是否存在
+    const fs = require('fs');
+    // videoPath可能是完整路径或相对路径，需要处理
+    let fullVideoPath = task.videoPath;
+    if (!task.videoPath.startsWith('/')) {
+      // 如果是相对路径（如"/44deeed0-8b9e-44c8-980c-61ea03d2de4c-r.mp4"），需要拼接完整路径
+      fullVideoPath = `/data/heygem_data/face2face/temp${task.videoPath}`;
+    }
+    
+    if (!fs.existsSync(fullVideoPath)) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Video file not found',
+        message: '视频文件在服务器上不存在'
+      });
+    }
+    
+    // 获取文件信息
+    const fileName = task.videoPath.split('/').pop();
+    const fileStats = fs.statSync(fullVideoPath);
+    
+    // 设置响应头
+    res.set({
+      'Content-Type': 'video/mp4',
+      'Content-Length': fileStats.size,
+      'Content-Disposition': `attachment; filename="video_${taskId}.mp4"`,
+      'Accept-Ranges': 'bytes'
+    });
+    
+    // 创建文件流并返回视频数据
+    const fileStream = fs.createReadStream(fullVideoPath);
+    fileStream.pipe(res);
+    
+  } catch (error) {
+    console.error('Video download error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      message: '下载视频文件失败'
+    });
+  }
+});
+
+// 12. 取消任务（可选功能）
 app.delete('/api/video/cancel/:taskId', async (req, res) => {
   try {
     const { taskId } = req.params;
@@ -891,7 +1052,7 @@ class TtsToVideoQueueProcessor {
             if (status === 2 && result) {
               task.status = 'completed';
               task.phase = 'completed';
-              task.videoPath = result;
+              task.videoPath = `/data/heygem_data/face2face/temp${result}`;
               task.completedAt = new Date().toISOString();
               task.processingTime = new Date() - new Date(task.startedAt);
               completed = true;

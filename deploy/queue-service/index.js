@@ -821,10 +821,10 @@ class TtsToVideoQueueProcessor extends BaseQueueProcessor {
       // 轮询视频生成状态
       let completed = false;
       let pollCount = 0;
-      const maxPolls = 180; // 最多轮询6分钟（每2秒一次）
+      const maxPolls = 180; // 最多轮询60分钟（每20秒一次）
       
       while (!completed && pollCount < maxPolls) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise(resolve => setTimeout(resolve, 20000));
         pollCount++;
         
         try {

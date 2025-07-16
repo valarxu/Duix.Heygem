@@ -774,12 +774,46 @@ class TtsToVideoQueueProcessor extends BaseQueueProcessor {
       await this.updateTaskStatus(task, 'processing', {
         ttsResult: task.ttsResult,
         ttsCompletedAt: new Date().toISOString(),
-        phase: 'video'
+        phase: 'transcription'
       });
       
       console.log(`TTS phase completed for task ${task.id}, audio saved to ${audioFilePath}`);
       
-      // 第二阶段：调用视频生成接口
+      // 第二阶段：调用Whisper转录服务
+      const audioHttpUrl = `https://69fcd5fc8b1e.ngrok-free.app/audios/${audioFileName}`;
+      console.log(`Starting transcription for task ${task.id} with audio: ${audioHttpUrl}`);
+      
+      let transcriptionResult = null;
+      try {
+        const transcriptionResponse = await axios.post(
+          'http://heygem-whisper:3001/transcribe',
+          { audio_url: audioHttpUrl },
+          {
+            timeout: 180000, // 3分钟超时
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        if (transcriptionResponse.data && transcriptionResponse.data.success) {
+          transcriptionResult = transcriptionResponse.data.data;
+          console.log(`Transcription completed for task ${task.id}`);
+        } else {
+          console.warn(`Transcription failed for task ${task.id}:`, transcriptionResponse.data?.error || 'Unknown error');
+        }
+      } catch (transcriptionError) {
+        console.warn(`Transcription error for task ${task.id}:`, transcriptionError.message);
+        // 转录失败不影响视频生成，继续执行
+      }
+      
+      await this.updateTaskStatus(task, 'processing', {
+        transcriptionResult: transcriptionResult,
+        transcriptionCompletedAt: new Date().toISOString(),
+        phase: 'video'
+      });
+      
+      // 第三阶段：调用视频生成接口
       // 确保参数中包含code字段
       if (!task.videoParams.code) {
         task.videoParams.code = `code_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -787,10 +821,10 @@ class TtsToVideoQueueProcessor extends BaseQueueProcessor {
       
       // 将音频文件路径转换为HTTP URL
       // 从 /data/heygem_data/face2face/temp/filename.wav 转换为 http://nginx-proxy/audios/filename.wav
-      const audioHttpUrl = `http://nginx-proxy/audios/${audioFileName}`;
-      task.videoParams.audio_url = audioHttpUrl;
+      const videoAudioHttpUrl = `http://nginx-proxy/audios/${audioFileName}`;
+      task.videoParams.audio_url = `http://nginx-proxy/audios/${audioFileName}`;
       
-      console.log(`Starting video generation for task ${task.id} with audio: ${audioHttpUrl}`);
+      console.log(`Starting video generation for task ${task.id} with audio: ${videoAudioHttpUrl}`);
       
       // 调用Heygem服务提交任务
       const submitResponse = await axios.post(
@@ -853,7 +887,8 @@ class TtsToVideoQueueProcessor extends BaseQueueProcessor {
             if (status === 2 && result) {
               await this.updateTaskStatus(task, 'completed', {
                 phase: 'completed',
-                videoPath: `/data/heygem_data/face2face/temp${result}`
+                videoPath: `/data/heygem_data/face2face/temp${result}`,
+                transcriptionResult: task.transcriptionResult || null
               });
               completed = true;
               console.log(`TTS-to-Video task ${task.id} completed successfully`);
@@ -877,7 +912,8 @@ class TtsToVideoQueueProcessor extends BaseQueueProcessor {
               if (pollCount > 30) { // 轮询超过1分钟后检查文件
                 await this.updateTaskStatus(task, 'completed', {
                   phase: 'completed',
-                  videoPath: `/data/heygem_data/face2face/temp/${videoFileName}`
+                  videoPath: `/data/heygem_data/face2face/temp/${videoFileName}`,
+                  transcriptionResult: task.transcriptionResult || null
                 });
                 completed = true;
                 console.log(`TTS-to-Video task ${task.id} marked as completed based on file existence`);
